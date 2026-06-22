@@ -7,10 +7,13 @@ state.json, and sends an email via Gmail SMTP on any change.
 
 import json
 import os
+import re
 import smtplib
 import ssl
 import sys
+import time
 import urllib.request
+import urllib.error
 from datetime import datetime
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -28,19 +31,44 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-GB,en;q=0.5",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Cache-Control": "max-age=0",
 }
 
 
 # ── Extraction ────────────────────────────────────────────────────────────────
 
-def fetch_page() -> str:
-    req = urllib.request.Request(GMC_URL, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+def fetch_page(retries: int = 3, delay: int = 10) -> str:
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(GMC_URL, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+                # Handle gzip/deflate transparently
+                encoding = resp.headers.get("Content-Encoding", "")
+                if encoding == "gzip":
+                    import gzip
+                    raw = gzip.decompress(raw)
+                elif encoding == "br":
+                    import brotli  # type: ignore
+                    raw = brotli.decompress(raw)
+                return raw.decode("utf-8", errors="replace")
+        except Exception as e:
+            last_err = e
+            print(f"  Attempt {attempt} failed: {e}")
+            if attempt < retries:
+                time.sleep(delay)
+    raise last_err
 
 
 def extract_snapshot(html: str) -> dict:
@@ -83,7 +111,6 @@ def extract_snapshot(html: str) -> dict:
         if "Annual retention fee due date" in line:
             # value is often inline after a colon, or on the next non-empty line
             combined = " ".join(lines[i:i+3])
-            import re
             m = re.search(r"(\d{2} \w+ \d{4})", combined)
             if m:
                 snap["retention_fee_date"] = m.group(1)
@@ -144,8 +171,11 @@ def main():
     try:
         html = fetch_page()
     except Exception as e:
-        print(f"  ERROR fetching page: {e}", file=sys.stderr)
-        sys.exit(1)
+        # Log but exit cleanly — transient network errors shouldn't
+        # mark the workflow run as failed (red X) in GitHub Actions.
+        print(f"  ERROR fetching page after retries: {e}", file=sys.stderr)
+        print("  Skipping this check. Will retry in 5 minutes.")
+        sys.exit(0)
 
     new_snap = extract_snapshot(html)
     old_snap = load_state()
